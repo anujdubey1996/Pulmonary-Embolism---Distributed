@@ -1,129 +1,213 @@
-#include <cuda_runtime.h>
-#include <cmath>
 #include <iostream>
+#include <cuda_runtime.h>
+
+#include <gdcmImageReader.h>
+#include <gdcmImage.h>
+#include <gdcmDataElement.h>
 
 using namespace std;
 
-__global__ void normalizeKernel(float *input, float *output, int numPixels, float minVal, float maxVal) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < numPixels) {
-        output[idx] = (input[idx] - minVal) / (maxVal - minVal);
+void loadDICOMImage(const char* filename, float *imageBuffer, int imageSize) {
+    gdcm::ImageReader reader;
+    reader.SetFileName(filename);
+    if (!reader.Read()) {
+        std::cerr << "Failed to read DICOM image: " << filename << std::endl;
+        exit(1);
+    }
+
+    const gdcm::Image &image = reader.GetImage();
+    if (image.GetPhotometricInterpretation() != gdcm::PhotometricInterpretation::MONOCHROME2) {
+        std::cerr << "Unsupported Photometric Interpretation." << std::endl;
+        exit(1);
+    }
+
+    image.GetBuffer((char*)imageBuffer);
+}
+
+
+// Windowing Kernel
+__global__ void windowingKernel(float *images, float *output, int numImages, int width, int height, float lowerBound, float upperBound) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numImages * width * height) {
+        float pixel = images[idx];
+        if (pixel < lowerBound) {
+            output[idx] = 0;
+        } else if (pixel > upperBound) {
+            output[idx] = 255;
+        } else {
+            output[idx] = 255 * (pixel - lowerBound) / (upperBound - lowerBound);
+        }
     }
 }
 
-__device__ float bilinearInterpolate(float tl, float tr, float bl, float br, float x_frac, float y_frac) {
-    float top = tl + x_frac * (tr - tl);
-    float bottom = bl + x_frac * (br - bl);
-    return top + y_frac * (bottom - top);
-}
+// Median Filter Kernel
+__global__ void medianFilter(float *images, float *output, int numImages, int width, int height) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int imageIdx = idx / (width * height);
+    int pixelIdx = idx % (width * height);
+    int x = pixelIdx % width;
+    int y = pixelIdx / width;
 
-__global__ void resizeKernel(float *input, float *output, int oldWidth, int oldHeight, int newWidth, int newHeight) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x > 0 && x < width - 1 && y > 0 && y < height - 1 && idx < numImages * width * height) {
+        float neighbors[9];
+        int nIdx = 0;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                neighbors[nIdx++] = images[imageIdx * width * height + (y + dy) * width + (x + dx)];
+            }
+        }
 
-    if (x < newWidth && y < newHeight) {
-        float gx = x * (oldWidth - 1) / (float)(newWidth - 1);
-        float gy = y * (oldHeight - 1) / (float)(newHeight - 1);
-        
-        int gxi = (int)gx;
-        int gyi = (int)gy;
+        // Insertion sort for simplicity
+        for (int i = 1; i < 9; i++) {
+            float key = neighbors[i];
+            int j = i - 1;
+            while (j >= 0 && neighbors[j] > key) {
+                neighbors[j + 1] = neighbors[j];
+                j = j - 1;
+            }
+            neighbors[j + 1] = key;
+        }
 
-        float x_frac = gx - gxi;
-        float y_frac = gy - gyi;
-
-        int idx00 = gyi * oldWidth + gxi;
-        int idx01 = gyi * oldWidth + gxi + 1;
-        int idx10 = (gyi + 1) * oldWidth + gxi;
-        int idx11 = (gyi + 1) * oldWidth + gxi + 1;
-
-        float result = bilinearInterpolate(input[idx00], input[idx01], input[idx10], input[idx11], x_frac, y_frac);
-        output[y * newWidth + x] = result;
+        output[idx] = neighbors[4]; // Median value
     }
 }
 
-__global__ void sobelFilterKernel(float *input, float *output, int width, int height) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
-        float x_weight = 0;
-        float y_weight = 0;
+__global__ void sobelEdgeDetection(float *images, float *output, int numImages, int width, int height) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numImages * width * height) {
+        int imageIdx = idx / (width * height);
+        int pixelIdx = idx % (width * height);
+        int x = pixelIdx % width;
+        int y = pixelIdx / width;
 
-        int offset = y * width + x;
-        x_weight = input[offset - width - 1] * -1.0 + input[offset - width + 1] * 1.0 +
-                   input[offset - 1] * -2.0 + input[offset + 1] * 2.0 +
-                   input[offset + width - 1] * -1.0 + input[offset + width + 1] * 1.0;
-        y_weight = input[offset - width - 1] * -1.0 + input[offset - width] * -2.0 + input[offset - width + 1] * -1.0 +
-                   input[offset + width - 1] * 1.0 + input[offset + width] * 2.0 + input[offset + width + 1] * 1.0;
+        if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
+            float Gx = images[imageIdx * width * height + (y - 1) * width + (x - 1)] * -1.0f +
+                       images[imageIdx * width * height + (y - 1) * width + (x + 1)] * 1.0f +
+                       images[imageIdx * width * height + y * width + (x - 1)] * -2.0f +
+                       images[imageIdx * width * height + y * width + (x + 1)] * 2.0f +
+                       images[imageIdx * width * height + (y + 1) * width + (x - 1)] * -1.0f +
+                       images[imageIdx * width * height + (y + 1) * width + (x + 1)] * 1.0f;
+            float Gy = images[imageIdx * width * height + (y - 1) * width + (x - 1)] * -1.0f +
+                       images[imageIdx * width * height + (y - 1) * width + x] * -2.0f +
+                       images[imageIdx * width * height + (y - 1) * width + (x + 1)] * -1.0f +
+                       images[imageIdx * width * height + (y + 1) * width + (x - 1)] * 1.0f +
+                       images[imageIdx * width * height + (y + 1) * width + x] * 2.0f +
+                       images[imageIdx * width * height + (y + 1) * width + (x + 1)] * 1.0f;
 
-        output[offset] = sqrt(x_weight * x_weight + y_weight * y_weight);
+            float edgeStrength = sqrtf(Gx * Gx + Gy * Gy);
+            output[idx] = edgeStrength;
+        } else {
+            // Handle boundaries: set edge strength to zero
+            output[idx] = 0.0f;
+        }
     }
 }
 
 
+// Function to check CUDA errors
+void checkCudaError(cudaError_t result, const char *msg) {
+    if (result != cudaSuccess) {
+        std::cerr << "CUDA Runtime Error: " << msg << " - " << cudaGetErrorString(result) << std::endl;
+        exit(-1);
+    }
+}
+
+// Function to allocate and initialize memory
+void allocateMemory(float **inputImages, float **processedImages, float **outputImages, int totalSize) {
+    // Allocate device memory for input, processed, and output images
+    checkCudaError(cudaMalloc(inputImages, totalSize * sizeof(float)), "Failed to allocate device memory for input images");
+    checkCudaError(cudaMalloc(processedImages, totalSize * sizeof(float)), "Failed to allocate device memory for processed images");
+    checkCudaError(cudaMalloc(outputImages, totalSize * sizeof(float)), "Failed to allocate device memory for output images");
+
+    // Example: Initialize input images with random values (for demonstration)
+    float *h_inputImages = new float[totalSize];
+    for (int i = 0; i < totalSize; i++) {
+        h_inputImages[i] = static_cast<float>(rand() % 256);
+    }
+
+    // Copy data from host to device
+    checkCudaError(cudaMemcpy(*inputImages, h_inputImages, totalSize * sizeof(float), cudaMemcpyHostToDevice), "Failed to copy data from host to device");
+
+    // Cleanup host memory
+    delete[] h_inputImages;
+}
+
+#include <gdcmImageReader.h>
+#include <gdcmImage.h>
+
+bool loadDICOMImage(const std::string& filename, float*& imageBuffer, int& width, int& height) {
+    gdcm::ImageReader reader;
+    reader.SetFileName(filename.c_str());
+    if (!reader.Read()) {
+        std::cerr << "Could not read DICOM image: " << filename << std::endl;
+        return false;
+    }
+
+    const gdcm::Image &image = reader.GetImage();
+    width = image.GetColumns();
+    height = image.GetRows();
+
+    if (imageBuffer != nullptr) {
+        delete[] imageBuffer;
+    }
+    imageBuffer = new float[width * height];
+
+    image.GetBuffer((char*)imageBuffer);
+
+    return true;
+}
+
+void processImages(const std::vector<std::string>& imagePaths, int numImagesToProcess) {
+    float *d_inputImage, *d_processedImage, *d_outputImage;
+
+    for (int i = 0; i < numImagesToProcess; ++i) {
+        int width, height;
+        float *h_inputImage = nullptr;
+
+        if (!loadDICOMImage(imagePaths[i], h_inputImage, width, height)) {
+            continue;  // Skip this image if there's a problem loading it
+        }
+
+        int imageSize = width * height;
+
+        // Allocate device memory
+        checkCudaError(cudaMalloc(&d_inputImage, imageSize * sizeof(float)), "Allocate input image");
+        checkCudaError(cudaMalloc(&d_processedImage, imageSize * sizeof(float)), "Allocate processed image");
+        checkCudaError(cudaMalloc(&d_outputImage, imageSize * sizeof(float)), "Allocate output image");
+
+        // Copy data from host to device
+        checkCudaError(cudaMemcpy(d_inputImage, h_inputImage, imageSize * sizeof(float), cudaMemcpyHostToDevice), "Copy input image to device");
+
+        // Configure kernel dimensions
+        int threadsPerBlock = 256;
+        int blocksPerGrid = (imageSize + threadsPerBlock - 1) / threadsPerBlock;
+
+        // Launch processing kernels (modify as needed)
+        windowingKernel<<<blocksPerGrid, threadsPerBlock>>>(d_inputImage, d_processedImage, width, height, 50.0f, 200.0f);
+        medianFilter<<<blocksPerGrid, threadsPerBlock>>>(d_processedImage, d_inputImage, width, height);
+        sobelEdgeDetection<<<blocksPerGrid, threadsPerBlock>>>(d_inputImage, d_outputImage, width, height);
+
+        // Copy back the results
+        float *h_outputImage = new float[imageSize];
+        checkCudaError(cudaMemcpy(h_outputImage, d_outputImage, imageSize * sizeof(float), cudaMemcpyDeviceToHost), "Copy output image to host");
+
+        // Process results as necessary
+
+        // Clean up
+        cudaFree(d_inputImage);
+        cudaFree(d_processedImage);
+        cudaFree(d_outputImage);
+        delete[] h_inputImage;
+        delete[] h_outputImage;
+    }
+}
 
 int main() {
-    // Image dimensions
-    const int oldWidth = 512, oldHeight = 512;
-    const int newWidth = 256, newHeight = 256;
-    const int numPixels = oldWidth * oldHeight;
-    const int newNumPixels = newWidth * newHeight;
+    vector<string> dicomFilePaths;
+    collectDicomFiles("/mnt/data/filtered_data/train/train", dicomFilePaths);
+    int numImagesToProcess = min(10, static_cast<int>(dicomFilePaths.size()));  // Process up to 10 images
 
-    // Allocate host memory
-    float *h_input = new float[numPixels];
-    float *h_normalized = new float[numPixels];
-    float *h_resized = new float[newNumPixels];
-    float *h_edges = new float[newNumPixels];
-
-    // Initialize input data
-    for (int i = 0; i < numPixels; i++) {
-        h_input[i] = static_cast<float>(rand()) / RAND_MAX * 255.0f; // Random float values
-    }
-
-    // Allocate device memory
-    float *d_input, *d_normalized, *d_resized, *d_edges;
-    cudaMalloc((void**)&d_input, numPixels * sizeof(float));
-    cudaMalloc((void**)&d_normalized, numPixels * sizeof(float));
-    cudaMalloc((void**)&d_resized, newNumPixels * sizeof(float));
-    cudaMalloc((void**)&d_edges, newNumPixels * sizeof(float));
-    cout<<"Allocated Memory"<<endl;
-    // Copy data to device
-    cudaMemcpy(d_input, h_input, numPixels * sizeof(float), cudaMemcpyHostToDevice);
-
-    // Launch normalization kernel
-    int blockSize = 256;
-    int numBlocks = (numPixels + blockSize - 1) / blockSize;
-    normalizeKernel<<<numBlocks, blockSize>>>(d_input, d_normalized, numPixels, 0.0f, 255.0f);
-
-    // Launch resize kernel
-    dim3 block(16, 16);
-    dim3 grid((newWidth + 15) / 16, (newHeight + 15) / 16);
-    resizeKernel<<<grid, block>>>(d_normalized, d_resized, oldWidth, oldHeight, newWidth, newHeight);
-
-    // Launch Sobel edge detection kernel
-    sobelFilterKernel<<<grid, block>>>(d_resized, d_edges, newWidth, newHeight);
-
-    // Copy results back to host
-    cudaMemcpy(h_normalized, d_normalized, numPixels * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_resized, d_resized, newNumPixels * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_edges, d_edges, newNumPixels * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Output some sample data
-    std::cout << "Sample outputs:" << std::endl;
-    std::cout << "Normalized: " << h_normalized[0] << ", " << h_normalized[1] << std::endl;
-    std::cout << "Resized: " << h_resized[0] << ", " << h_resized[1] << std::endl;
-    std::cout << "Edges: " << h_edges[0] << ", " << h_edges[1] << std::endl;
-
-    // Free device memory
-    cudaFree(d_input);
-    cudaFree(d_normalized);
-    cudaFree(d_resized);
-    cudaFree(d_edges);
-
-    // Free host memory
-    delete[] h_input;
-    delete[] h_normalized;
-    delete[] h_resized;
-    delete[] h_edges;
+    processImages(dicomFilePaths, numImagesToProcess);
 
     return 0;
 }
